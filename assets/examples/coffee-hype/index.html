@@ -1,0 +1,917 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>山野咖啡开业</title>
+<style>
+  html,body{margin:0;background:#000;height:100%;overflow:hidden}
+  body{display:flex;align-items:center;justify-content:center}
+  canvas{display:block;max-width:100vw;max-height:100vh}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+/* =========================================================================
+   motion-reel engine — render(t) is a pure function of time.
+   One timeline, three formats: open with ?fmt=9x16 | 1x1 | 16x9
+   Preview: open in a browser (space = pause, ←/→ = frame step, click = restart)
+   ========================================================================= */
+
+/* ---------- 1. CONFIG (edit) ---------- */
+const CONFIG = {
+  TITLE: '山野咖啡开业',
+  DUR: 20,          // seconds
+  FPS: 60,
+  BPM: 120,        // beat = 0.5s at 120
+};
+const C = {        // palette tokens — replace with the brand's real colors
+  // brand: 墨绿 #1F3D2B, 奶油 #F3E9D2 (user). accent 焙烤橙 is ours — the one loud colour (drop + CTA)
+  bg: '#1F3D2B', bg2: '#2E5A3F', ink: '#F3E9D2', mute: '#9DB3A3',
+  accent: '#E0692C', accent2: '#15291D', light: '#F3E9D2',
+  green: '#1F3D2B', cream: '#F3E9D2', deep: '#15291D',
+};
+// Noto Sans/Serif SC are free for commercial use; render.py warns if the first family isn't installed
+// (Chrome would silently fall back — Microsoft YaHei needs a commercial licence).
+const F_CJK = '"Noto Sans SC", "Microsoft YaHei", "PingFang SC", sans-serif';
+const F_SER = '"Noto Serif SC", "Source Han Serif SC", "SimSun", serif';   // editorial / food / culture brands
+const F_LAT = '"Bahnschrift", "Segoe UI", "Helvetica Neue", Arial, sans-serif';
+const FONTS_TO_LOAD = [`900 100px ${F_CJK}`, `700 100px ${F_CJK}`, `500 100px ${F_CJK}`, `700 100px ${F_LAT}`, `900 100px ${F_SER}`, `700 100px ${F_SER}`];
+const FONT_FAMILIES = ['Noto Sans SC', 'Bahnschrift', 'Noto Serif SC'];
+
+/* ---------- 2. format & layout ---------- */
+const FORMATS = { '9x16': [1080, 1920], '1x1': [1080, 1080], '16x9': [1920, 1080] };
+const FMT = new URLSearchParams(location.search).get('fmt') || '9x16';
+const [W, H] = FORMATS[FMT];
+const { DUR, FPS } = CONFIG;
+const BEAT = 60 / CONFIG.BPM;
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+cv.style.aspectRatio = `${W}/${H}`;
+cv.style[W < H ? 'height' : 'width'] = W < H ? '100vh' : '100vw';
+const X = cv.getContext('2d');
+
+// Design every scene in units of L.u (1u = 1px when the short edge is 1080).
+// Place things relative to L.cx / L.cy / L.safe, never at fixed pixels, so all formats work.
+const L = (() => {
+  const u = Math.min(W, H) / 1080;
+  const vert = H > W, wide = W / H > 1.3;
+  // vertical short-video apps cover the top ~8% and bottom ~18% with UI; keep key content inside safe
+  const top = (vert ? 170 : 80) * u, bottom = H - (vert ? 360 : 90) * u;
+  const side = (vert ? 80 : wide ? 140 : 90) * u;
+  return { W, H, u, vert, wide, cx: W / 2, cy: H / 2, safe: { x: side, y: top, w: W - 2 * side, h: bottom - top, bottom } };
+})();
+
+/* ---------- 3. math, easing, springs, seeded noise ---------- */
+const clamp = (v, a = 0, b = 1) => Math.min(b, Math.max(a, v));
+const lerp = (a, b, t) => a + (b - a) * t;
+const seg = (t, a, b) => clamp((t - a) / (b - a));
+const TAU = Math.PI * 2;
+const E = {
+  outCubic: t => 1 - Math.pow(1 - t, 3),
+  inCubic: t => t * t * t,
+  inOutCubic: t => t < .5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2,
+  outExpo: t => t >= 1 ? 1 : 1 - Math.pow(2, -10 * t),
+  inExpo: t => t <= 0 ? 0 : Math.pow(2, 10 * t - 10),
+  inOutExpo: t => t <= 0 ? 0 : t >= 1 ? 1 : t < .5 ? Math.pow(2, 20 * t - 10) / 2 : (2 - Math.pow(2, -20 * t + 10)) / 2,
+  outBack: (t, s = 1.70158) => 1 + (s + 1) * Math.pow(t - 1, 3) + s * Math.pow(t - 1, 2),
+  outElastic: t => t <= 0 ? 0 : t >= 1 ? 1 : Math.pow(2, -10 * t) * Math.sin((t * 10 - .75) * (TAU / 3)) + 1,
+};
+// Closed-form damped spring 0→1, pure function of time since start. k = stiffness, d = damping.
+function spring(t, k = 170, d = 26) {
+  if (t <= 0) return 0;
+  const w0 = Math.sqrt(k), z = d / (2 * w0);
+  if (z < 1) {
+    const wd = w0 * Math.sqrt(1 - z * z);
+    return 1 - Math.exp(-z * w0 * t) * (Math.cos(wd * t) + (z * w0 / wd) * Math.sin(wd * t));
+  }
+  return 1 - Math.exp(-w0 * t) * (1 + w0 * t);
+}
+// overshoot: snappy ≈ 1 % · def ≈ 0 % · heavy 0 % · playful ≈ 21 % (leave room — playful items poke past their target)
+const SPR = { snappy: [320, 30], def: [170, 26], heavy: [80, 20], playful: [180, 12] };
+const sp = (t, preset = 'def') => spring(t, ...SPR[preset]);
+// A value that changes target several times: one spring per change, summed. keys = [[time, value], ...]
+function track(t, keys, preset = 'def') {
+  let v = keys[0][1];
+  for (let i = 1; i < keys.length; i++) v += (keys[i][1] - keys[i - 1][1]) * sp(t - keys[i][0], preset);
+  return v;
+}
+function hr(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); } // hash → [0,1)
+function hexA(hex, a) { const n = parseInt(hex.slice(1), 16); return `rgba(${n >> 16 & 255},${n >> 8 & 255},${n & 255},${a})`; }
+function mixHex(h1, h2, t) {
+  const a = parseInt(h1.slice(1), 16), b = parseInt(h2.slice(1), 16), m = (s) => Math.round(lerp(a >> s & 255, b >> s & 255, t));
+  return `rgb(${m(16)},${m(8)},${m(0)})`;
+}
+
+/* ---------- 4. text & shape helpers (sizes in px — pass n * L.u) ---------- */
+function font(px, w = 900, fam = F_CJK) { X.font = `${w} ${px}px ${fam}`; }
+function rr(x, y, w, h, r) {
+  X.beginPath(); X.moveTo(x + r, y); X.arcTo(x + w, y, x + w, y + h, r); X.arcTo(x + w, y + h, x, y + h, r);
+  X.arcTo(x, y + h, x, y, r); X.arcTo(x, y, x + w, y, r); X.closePath();
+}
+// text may be a string or colored segments: [['拿到', C.ink], ['offer', C.accent]]
+const segs = (s, col) => typeof s === 'string' ? [[s, col]] : s;
+function layout(sg, size, w, fam, gap) {
+  font(size, w, fam);
+  const chars = []; let total = 0;
+  for (const [s, col] of sg) for (const ch of s) { const cw = X.measureText(ch).width; chars.push({ ch, col, cw }); total += cw + gap; }
+  return { chars, total: total - gap };
+}
+// largest size ≤ size at which the text fits maxW — use this for anything that must survive 9:16
+function fit(s, size, maxW, o = {}) {
+  const Lx = layout(segs(s, '#000'), size, o.w ?? 900, o.fam ?? F_CJK, o.gap ?? 0);
+  return Lx.total > maxW ? size * maxW / Lx.total : size;
+}
+function T(s, x, y, size, o = {}) {
+  const { w = 900, col = C.ink, align = 'center', fam = F_CJK, gap = 0, alpha = 1 } = o;
+  const Lx = layout(segs(s, col), size, w, fam, gap);
+  let cx = align === 'center' ? x - Lx.total / 2 : align === 'right' ? x - Lx.total : x;
+  X.save(); X.globalAlpha *= alpha; X.textBaseline = 'alphabetic'; X.textAlign = 'left';
+  for (const c of Lx.chars) { X.fillStyle = c.col; X.fillText(c.ch, cx, y); cx += c.cw + gap; }
+  X.restore();
+  return Lx.total;
+}
+// per-character rise through a mask; exit = time the line leaves upward (optional)
+function rise(s, x, y, size, t, t0, o = {}) {
+  const { w = 900, col = C.ink, align = 'center', fam = F_CJK, gap = 0, st = 0.035, dur = 0.4, exit = null } = o;
+  const Lx = layout(segs(s, col), size, w, fam, gap);
+  let cx = align === 'center' ? x - Lx.total / 2 : align === 'right' ? x - Lx.total : x;
+  X.save(); X.textBaseline = 'alphabetic'; X.textAlign = 'left';
+  Lx.chars.forEach((c, i) => {
+    const p = E.outExpo(seg(t, t0 + i * st, t0 + i * st + dur));
+    let off = (1 - p) * size * 1.25;
+    if (exit !== null) off -= E.inExpo(seg(t, exit + i * st * .6, exit + i * st * .6 + .3)) * size * 1.25;
+    if (p > 0) {
+      X.save(); X.beginPath(); X.rect(cx - 6, y - size * 1.05, c.cw + 12, size * 1.35); X.clip();
+      X.fillStyle = c.col; X.fillText(c.ch, cx, y + off); X.restore();
+    }
+    cx += c.cw + gap;
+  });
+  X.restore();
+}
+// Stroke a polyline up to progress p (0–1) by length — line-draw reveals, routes, underlines, icons.
+function poly(pts, p, o = {}) {
+  const { col = C.ink, lw = 6 * L.u, dash = null, close = false } = o;
+  const P = close ? [...pts, pts[0]] : pts;
+  const len = []; let tot = 0;
+  for (let i = 1; i < P.length; i++) { const l = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]); len.push(l); tot += l; }
+  let left = clamp(p) * tot;
+  X.save(); X.strokeStyle = col; X.lineWidth = lw; X.lineCap = 'round'; X.lineJoin = 'round'; if (dash) X.setLineDash(dash);
+  X.beginPath(); X.moveTo(...P[0]);
+  for (let i = 1; i < P.length && left > 0; i++) {
+    const u = Math.min(1, left / len[i - 1]);
+    X.lineTo(lerp(P[i - 1][0], P[i][0], u), lerp(P[i - 1][1], P[i][1], u)); left -= len[i - 1];
+  }
+  X.stroke(); X.restore();
+}
+// scale-pop around (x, y): wraps any drawing — pop(t, 3.2, x, y, () => { ...draw at (x, y)... })
+function pop(t, t0, x, y, draw, preset = 'snappy') {
+  const s = sp(t - t0, preset); if (s <= 0.001) return;
+  X.save(); X.translate(x, y); X.scale(s, s); X.translate(-x, -y); draw(); X.restore();
+}
+// punch-in from large scale with a speed echo. The zoom pivots on (x, y): with align 'left' it grows rightward.
+function slam(s, x, y, size, t, t0, o = {}) {
+  const p = seg(t, t0, t0 + 0.3);
+  if (p <= 0) return;
+  const sc = lerp(1.9, 1, E.outExpo(p));
+  X.save();
+  X.translate(x, y - size * .35); X.scale(sc, sc); X.translate(-x, -(y - size * .35));
+  if (p < .6) { X.save(); X.globalAlpha = .25 * (1 - p / .6); X.translate(0, -size * .12); T(s, x, y, size, o); X.restore(); }
+  X.globalAlpha = clamp(p * 6);
+  T(s, x, y, size, o);
+  X.restore();
+}
+
+/* ---------- 5. backgrounds ---------- */
+function bgDeep(t, base = C.bg) {
+  X.fillStyle = base; X.fillRect(0, 0, W, H);
+  const g = X.createRadialGradient(L.cx, H * .42, 0, L.cx, H * .42, Math.max(W, H) * .75);
+  g.addColorStop(0, hexA(C.bg2, .6)); g.addColorStop(1, hexA(base, 0));
+  X.fillStyle = g; X.fillRect(0, 0, W, H);
+  // a quiet structural texture (slow-moving fine grid) instead of decorative particles
+  X.strokeStyle = hexA('#FFFFFF', .035); X.lineWidth = 1;
+  const step = 90 * L.u, off = (t * 30 * L.u) % step;
+  X.beginPath();
+  for (let x = 0; x <= W; x += step) { X.moveTo(x, 0); X.lineTo(x, H); }
+  for (let y = -step + off; y <= H; y += step) { X.moveTo(0, y); X.lineTo(W, y); }
+  X.stroke();
+}
+
+/* ---------- 5b. FX LIBRARY — the showreel moves. Combine 2–3 per shot (see references/energy.md) ---------- */
+const GLYPHS = 'ABCDEFGHJKLMNPQRSTUVWXYZ0123456789#%&*/<>+=';
+
+// Kinetic word: one call, six motion languages. style: 'rise' | 'spin' | 'smear' | 'bounce' | 'stroke' | 'glitch'
+// o: { w, fam, col, alt (2nd colour for alternating letters), align, gap, st (stagger s) }
+function kine(s, x, y, size, t, t0, style = 'rise', o = {}) {
+  const { w = 900, fam = F_CJK, col = C.ink, alt = null, align = 'center', gap = 0, st = 0.035 } = o;
+  const Lx = layout(segs(s, col), size, w, fam, gap);
+  let cx = align === 'center' ? x - Lx.total / 2 : align === 'right' ? x - Lx.total : x;
+  const lt = t - t0;
+  if (lt < 0) return;
+  X.save(); X.textBaseline = 'alphabetic'; X.textAlign = 'left'; font(size, w, fam);
+  Lx.chars.forEach((c, i) => {
+    const d = i * st, fill = alt && i % 2 ? alt : c.col;
+    X.save();
+    if (style === 'rise') {
+      const p = E.outExpo(seg(lt, d, d + .32));
+      X.beginPath(); X.rect(cx - 8, y - size * 1.05, c.cw + 16, size * 1.35); X.clip();
+      X.translate(0, (1 - p) * size * 1.2); X.fillStyle = fill; X.fillText(c.ch, cx, y);
+    } else if (style === 'spin') {            // letters scale up from 0 while unrotating, overshoot
+      const p = seg(lt, d, d + .34), s2 = E.outBack(p, 2.4);
+      X.translate(cx + c.cw / 2, y - size * .35); X.rotate((1 - E.outCubic(p)) * -Math.PI * .6); X.scale(s2, s2);
+      X.fillStyle = fill; X.fillText(c.ch, -c.cw / 2, size * .35);
+    } else if (style === 'smear') {           // slides in from the right, stretched, with a ghost trail
+      const p = E.outExpo(seg(lt, d * .8, d * .8 + .3)), off = (1 - p) * W * .8, str = 1 + (1 - p) * 1.8;
+      for (let g = 4; g >= 0; g--) {
+        X.save(); X.globalAlpha = g ? .13 * (1 - p) : 1;
+        X.translate(cx + off + g * 60 * L.u * (1 - p), y); X.scale(str, 1 / Math.sqrt(str));
+        X.fillStyle = g ? (alt || C.accent) : fill; X.fillText(c.ch, 0, 0); X.restore();
+      }
+    } else if (style === 'bounce') {          // drops in with elastic landing + squash, then keeps a pulse
+      const p = seg(lt, d, d + .32);
+      const yy = (1 - E.outElastic(p)) * -size * 2.2;
+      const sq = 1 + .25 * Math.max(0, Math.sin(p * Math.PI * 3)) * (1 - p);
+      const pulse = Math.sin(lt * 26 - i * 1.1) * size * .04 * seg(lt, .3, .45);
+      X.translate(cx + c.cw / 2, y + yy + pulse); X.scale(sq, 1 / sq);
+      X.fillStyle = fill; X.fillText(c.ch, -c.cw / 2, 0);
+    } else if (style === 'stroke') {          // outline draws first, then the fill wipes up
+      X.globalAlpha = seg(lt, d, d + .12);
+      X.lineWidth = Math.max(2, size * .012); X.strokeStyle = fill; X.strokeText(c.ch, cx, y);
+      const pf = E.inOutCubic(seg(lt, .12 + d, .3 + d));
+      X.beginPath(); X.rect(cx - 5, y - size * 1.02 + (1 - pf) * size * 1.3, c.cw + 10, size * 1.3); X.clip();
+      X.fillStyle = fill; X.fillText(c.ch, cx, y);
+    } else if (style === 'glitch') {          // RGB split + slice jitter that settles in 0.35 s
+      const g = 1 - seg(lt, 0, .35), fr = Math.floor(t * 30);
+      const jx = (hr(fr * 7 + i) - .5) * size * .25 * g, jy = (hr(fr * 3 + i + 9) - .5) * size * .08 * g;
+      if (g > 0) {
+        X.globalCompositeOperation = 'lighter'; X.globalAlpha = .75 * g;
+        X.fillStyle = '#FF2D55'; X.fillText(c.ch, cx + jx + size * .04, y + jy);
+        X.fillStyle = '#2DE1FF'; X.fillText(c.ch, cx - jx - size * .04, y - jy);
+        X.globalCompositeOperation = 'source-over'; X.globalAlpha = 1;
+      }
+      X.fillStyle = fill; X.fillText(c.ch, cx + jx * .3, y);
+    }
+    X.restore();
+    cx += c.cw + gap;
+  });
+  X.restore();
+}
+// Decoding text: random glyphs resolve left→right. Returns the string to draw this frame.
+function scramble(str, t, t0, dur = .4, seed = 0) {
+  const p = (t - t0) / dur; if (p <= 0) return '';
+  const fr = Math.floor(t * 30); let out = '';
+  [...str].forEach((ch, i, a) => {
+    const r = i / a.length;
+    if (p >= r + .35) out += ch;
+    else if (p >= r * .6) out += ch === ' ' ? ' ' : GLYPHS[Math.floor(hr(fr * 13 + i * 7 + seed) * GLYPHS.length)];
+  });
+  return out;
+}
+// Rolling counter: draws the number value would show at time t (0 → to over [t0, t0+dur]).
+function counter(to, x, y, size, t, t0, dur = .4, o = {}) {
+  const v = to * E.outExpo(seg(t, t0, t0 + dur));
+  const s = (o.decimals ? v.toFixed(o.decimals) : String(Math.round(v))) + (o.suffix || '');
+  T(s, x, y, size, { fam: F_LAT, w: 700, ...o });
+}
+
+// Shapes as 240-point outlines so any two can morph. kind: circle|square|tri|star|flower|hex
+function shapePts(kind, r, n = 240) {
+  const poly = (verts) => {
+    const Ls = []; let tot = 0;
+    verts.forEach((a, i) => { const b = verts[(i + 1) % verts.length]; const l = Math.hypot(b[0] - a[0], b[1] - a[1]); Ls.push(l); tot += l; });
+    return Array.from({ length: n }, (_, k) => {
+      let d = k / n * tot, i = 0; while (d > Ls[i]) { d -= Ls[i]; i++; }
+      const a = verts[i], b = verts[(i + 1) % verts.length], u = d / Ls[i];
+      return [lerp(a[0], b[0], u), lerp(a[1], b[1], u)];
+    });
+  };
+  const reg = (m, rr2, rot = -Math.PI / 2) => Array.from({ length: m }, (_, i) => [Math.cos(rot + i / m * TAU) * rr2, Math.sin(rot + i / m * TAU) * rr2]);
+  const ang = k => -Math.PI / 2 + k / n * TAU;
+  if (kind === 'circle') return Array.from({ length: n }, (_, k) => [Math.cos(ang(k)) * r, Math.sin(ang(k)) * r]);
+  if (kind === 'flower') return Array.from({ length: n }, (_, k) => { const q = r * (1 + .22 * Math.cos(ang(k) * 6)); return [Math.cos(ang(k)) * q, Math.sin(ang(k)) * q]; });
+  if (kind === 'square') return poly(reg(4, r * 1.2, -Math.PI / 4));
+  if (kind === 'tri') return poly(reg(3, r * 1.3));
+  if (kind === 'hex') return poly(reg(6, r * 1.1));
+  if (kind === 'star') return poly(Array.from({ length: 10 }, (_, i) => { const q = i % 2 ? r * .55 : r * 1.25, a = -Math.PI / 2 + i / 10 * TAU; return [Math.cos(a) * q, Math.sin(a) * q]; }));
+}
+function morphPath(A, B, p, x, y, s = 1, rot = 0) {
+  const c = Math.cos(rot), sn = Math.sin(rot);
+  X.beginPath();
+  A.forEach((a, i) => {
+    const px = lerp(a[0], B[i][0], p) * s, py = lerp(a[1], B[i][1], p) * s;
+    const X1 = x + px * c - py * sn, Y1 = y + px * sn + py * c;
+    i ? X.lineTo(X1, Y1) : X.moveTo(X1, Y1);
+  });
+  X.closePath();
+}
+// Onion-skin trail: calls draw(tt, alpha) for n past moments — motion you can see.
+function trail(t, n, dt, draw) { for (let k = n; k >= 1; k--) draw(t - k * dt, .08 * (n + 1 - k) / n); }
+
+// Expanding ring on an impact.
+function shockwave(x, y, t, t0, o = {}) {
+  const { col = '#FFFFFF', max = 900 * L.u, dur = .6, lw = 8 * L.u } = o;
+  const q = seg(t, t0, t0 + dur); if (q <= 0 || q >= 1) return;
+  X.save(); X.strokeStyle = hexA(col, 1 - q); X.lineWidth = lw * (1 - q) + 1;
+  X.beginPath(); X.arc(x, y, 40 * L.u + E.outExpo(q) * max, 0, TAU); X.stroke(); X.restore();
+}
+// Rotating rays behind a hero moment.
+function sunburst(x, y, t, o = {}) {
+  const { col = C.accent, alpha = .1, n = 18, spin = .25 } = o;
+  X.save(); X.translate(x, y); X.rotate(t * spin); X.fillStyle = hexA(col, alpha);
+  const R = Math.hypot(W, H);
+  for (let i = 0; i < n; i++) { X.rotate(TAU / n); X.beginPath(); X.moveTo(0, 0); X.lineTo(-R * .09, -R); X.lineTo(R * .09, -R); X.closePath(); X.fill(); }
+  X.restore();
+}
+// Radial speed lines (zooms, drops). strength 0–1.
+function speedLines(x, y, t, strength, o = {}) {
+  if (strength <= 0) return;
+  const { col = '#FFFFFF', n = 70 } = o;
+  X.save(); X.strokeStyle = hexA(col, .55 * strength); X.lineWidth = 3 * L.u;
+  for (let i = 0; i < n; i++) {
+    const a = hr(i) * TAU, r0 = (200 + hr(i + 9) * 300 + strength * 500) * L.u, r1 = r0 + (200 + strength * 900) * L.u;
+    X.beginPath(); X.moveTo(x + Math.cos(a) * r0, y + Math.sin(a) * r0); X.lineTo(x + Math.cos(a) * r1, y + Math.sin(a) * r1); X.stroke();
+  }
+  X.restore();
+}
+// Distance travelled with a speed burst after each beat time → speed-ramped camera.
+function rampZ(t, t0, base = 900, bursts = [], kick = 1400) {
+  let z = (t - t0) * base;
+  for (const b of bursts) if (t > b) z += kick * (1 - Math.exp(-(t - b) * 9));
+  return z;
+}
+// Tunnel of frames flying at the camera. z from rampZ.
+function tunnel(x, y, z, t, o = {}) {
+  const { cols = [C.accent, '#FFFFFF', C.bg2], n = 14, spacing = 380, fov = 700, aspect = W / H > 1 ? 1.6 : .62, twist = .0006 } = o;
+  for (let i = n - 1; i >= 0; i--) {
+    const zi = ((i * spacing - z) % (n * spacing) + n * spacing) % (n * spacing) + 60;
+    const s = fov / zi, half = 900 * L.u * s, a = Math.exp(-zi / 3000) * clamp((zi - 60) / 300);
+    const k = ((i - Math.floor((i * spacing - z) / (n * spacing)) * n) % cols.length + cols.length) % cols.length;
+    X.save(); X.translate(x, y); X.rotate(zi * twist + t * .3);
+    X.strokeStyle = hexA(cols[k], a); X.lineWidth = Math.max(1, 14 * L.u * s);
+    X.strokeRect(-half * aspect, -half, half * aspect * 2, half * 2); X.restore();
+  }
+}
+// Text on a rotating 3D ring (letters behind are dim and reversed, as they should be).
+function ring3D(str, x, y, R, spin, size, o = {}) {
+  const { tilt = .36, front = C.accent, back = '#FFFFFF', fam = F_LAT, w = 700, cam = 1500 } = o;
+  const chars = [...str];
+  const items = chars.map((ch, i) => {
+    const a = i / chars.length * TAU + spin;
+    return { ch, a, x: -Math.sin(a) * R, y: Math.cos(a) * R * tilt, z: Math.cos(a) * R + cam };
+  }).sort((p, q) => q.z - p.z);
+  X.save(); X.textAlign = 'center'; X.textBaseline = 'middle';
+  for (const it of items) {
+    const s = cam / it.z, f = clamp((cam - it.z) / R * .5 + .5);
+    X.save(); X.translate(x + it.x * s, y + it.y * s); X.scale(s * Math.max(.15, Math.abs(Math.cos(it.a))), s);
+    X.fillStyle = f > .5 ? mixHex(front, back, (f - .5) * 2) : hexA(back, .15 + f * .5);
+    font(size, /[一-龥]/.test(it.ch) ? 900 : w, /[一-龥]/.test(it.ch) ? F_CJK : fam); X.fillText(it.ch, 0, 0);
+    X.restore();
+  }
+  X.restore();
+}
+// Generative flow field: a grid of dashes steered by an attractor; shockwave on each beat;
+// optional morph to dots and vortex collapse. o.attractor(t) -> [x, y]
+function flowField(t, t0, o = {}) {
+  const { cell = 60 * L.u, beats = [], cols = [C.bg2, '#FFFFFF', C.accent], hot = C.accent, dots = null, vortex = null,
+          attractor = tt => [L.cx + Math.sin(tt * 1.9) * W * .27, L.cy + Math.sin(tt * 2.7 + 1) * H * .24] } = o;
+  const nx = Math.ceil(W / cell), ny = Math.ceil(H / cell), lt = t - t0;
+  const [ax, ay] = attractor(t);
+  const toDot = dots ? E.inOutCubic(seg(t, dots[0], dots[1])) : 0;
+  const vort = vortex ? E.inExpo(seg(t, vortex[0], vortex[1])) : 0;
+  X.save(); X.lineCap = 'round';
+  for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) {
+    let x = (i + .5) * cell, y = (j + .5) * cell;
+    const dC = Math.hypot(x - L.cx, y - L.cy) / L.u;
+    const pop = E.outBack(seg(lt, dC / 2400, dC / 2400 + .3), 2.2); if (pop <= 0) continue;
+    const dA = Math.hypot(x - ax, y - ay);
+    let ang = Math.atan2(y - ay, x - ax) + Math.PI / 2 + Math.sin(i * .35 + lt * 2) * .6 + Math.cos(j * .4 - lt * 1.6) * .6;
+    let wave = 0;
+    for (const b of beats) if (t >= b) { const dd = Math.abs(dA - (t - b) * 2200 * L.u); wave += Math.exp(-dd * dd / (5000 * L.u * L.u)) * Math.exp(-(t - b) * 3); }
+    if (vort > 0) {
+      const dx = x - L.cx, dy = y - L.cy, r = Math.hypot(dx, dy), a = Math.atan2(dy, dx) + vort * (6 - r / (400 * L.u));
+      x = L.cx + Math.cos(a) * r * (1 - vort); y = L.cy + Math.sin(a) * r * (1 - vort); ang += vort * 8;
+    }
+    const near = Math.exp(-dA / (380 * L.u));
+    const len = (18 + 16 * near + 24 * wave) * L.u * pop * (1 - toDot * .85) * (1 - vort * .5);
+    const h = (Math.sin(ang) + 1) / 2;
+    const col = wave > .35 ? hot : h < .5 ? mixHex(cols[0], cols[1], h * 2) : mixHex(cols[1], cols[2], (h - .5) * 2);
+    X.strokeStyle = col; X.fillStyle = col; X.lineWidth = (3 + 3 * wave) * L.u * pop;
+    const c = Math.cos(ang) * len, s = Math.sin(ang) * len;
+    if (toDot < 1) { X.beginPath(); X.moveTo(x - c, y - s); X.lineTo(x + c, y + s); X.stroke(); }
+    if (toDot > 0) { X.beginPath(); X.arc(x, y, (4 + 14 * near + 16 * wave) * L.u * toDot * pop * (1 - vort * .6), 0, TAU); X.fill(); }
+  }
+  X.restore();
+}
+// Moving diagonal stripes (energy backgrounds for rapid cuts). dir ±1 alternates per cut.
+function stripes(t, col, alpha = .08, dir = 1, speed = 700) {
+  X.save(); X.globalAlpha = alpha; X.fillStyle = col;
+  const step = 90 * L.u, sl = H * .3;
+  for (let i = -Math.ceil(sl / step) - 2; i < W / step + 2; i++) {
+    const x = i * step + dir * ((t * speed * L.u) % step);
+    X.beginPath(); X.moveTo(x, 0); X.lineTo(x + step * .45, 0); X.lineTo(x + step * .45 - sl, H); X.lineTo(x - sl, H); X.fill();
+  }
+  X.restore();
+}
+// A diagonal highlight passing over a rect (buttons, logos, prices).
+function sheen(x, y, w, h, r, t, t0, dur = .5) {
+  const q = seg(t, t0, t0 + dur); if (q <= 0 || q >= 1) return;
+  X.save(); rr(x, y, w, h, r); X.clip();
+  X.translate(x - w * .3 + q * w * 1.6, y + h / 2); X.rotate(.35);
+  X.fillStyle = 'rgba(255,255,255,0.45)'; X.fillRect(-h * .25, -h * 2, h * .5, h * 4); X.restore();
+}
+
+/* =========================================================================
+   6. SCENES — draw(t) receives the GLOBAL time.
+   Replace everything between SCENES START and SCENES END (demo scenes + timeline lists).
+   ========================================================================= */
+/* ===== SCENES START ===== */
+// ---------------------------------------------------------------- shared helpers
+const U = L.u;
+// overscanned background: zoom/slice transitions scale or shift a scene, so never leave the frame uncovered
+function fillBg(col) { X.fillStyle = col; X.fillRect(-W, -H, W * 3, H * 3); }
+// point at length-fraction p along a polyline (matches poly()'s reveal)
+function along(P, p) {
+  const len = []; let tot = 0;
+  for (let i = 1; i < P.length; i++) { const l = Math.hypot(P[i][0] - P[i - 1][0], P[i][1] - P[i - 1][1]); len.push(l); tot += l; }
+  let left = clamp(p) * tot;
+  for (let i = 1; i < P.length; i++) {
+    if (left <= len[i - 1]) { const u = left / len[i - 1]; return [lerp(P[i - 1][0], P[i][0], u), lerp(P[i - 1][1], P[i][1], u)]; }
+    left -= len[i - 1];
+  }
+  return P[P.length - 1];
+}
+// takeaway cup, drawn around (x, y) = body centre; s = scale (pass n * U). steam animates with t.
+function cup(x, y, s, t, o = {}) {
+  const { body = C.cream, band = C.accent, ink = C.green, steam = 1, tilt = 0 } = o;
+  X.save(); X.translate(x, y); X.rotate(tilt); X.scale(s, s);
+  if (steam > 0) {
+    X.lineCap = 'round'; X.lineWidth = 12; X.strokeStyle = hexA(body.startsWith('#') ? body : '#FFFFFF', .85 * steam);
+    for (let k = -1; k <= 1; k++) {
+      X.beginPath();
+      for (let j = 0; j <= 16; j++) {
+        const yy = -238 - j * 7, xx = k * 44 + Math.sin(j * .45 - t * 9 + k * 1.7) * 14 * (j / 16 + .3);
+        j ? X.lineTo(xx, yy) : X.moveTo(xx, yy);
+      }
+      X.stroke();
+    }
+  }
+  X.fillStyle = body;
+  rr(-120, -205, 240, 36, 14); X.fill(); rr(-98, -224, 196, 28, 12); X.fill();          // lid
+  X.beginPath(); X.moveTo(-108, -166); X.lineTo(108, -166); X.lineTo(82, 150);            // body
+  X.quadraticCurveTo(80, 166, 62, 166); X.lineTo(-62, 166); X.quadraticCurveTo(-80, 166, -82, 150); X.closePath(); X.fill();
+  X.fillStyle = band;                                                                      // sleeve
+  X.beginPath(); X.moveTo(-100, -72); X.lineTo(100, -72); X.lineTo(91, 48); X.lineTo(-91, 48); X.closePath(); X.fill();
+  X.fillStyle = ink;                                                                       // mountain mark
+  X.beginPath(); X.moveTo(-52, 26); X.lineTo(-14, -40); X.lineTo(8, -8); X.lineTo(26, -28); X.lineTo(56, 26); X.closePath(); X.fill();
+  X.restore();
+}
+// coffee bean; flip = horizontal scale (cos of a spin angle fakes a 3D turn)
+function bean(x, y, r, rot, col, crease, flip = 1) {
+  if (r <= 0) return;
+  X.save(); X.translate(x, y); X.rotate(rot); X.scale(flip, 1);
+  X.fillStyle = col; X.beginPath(); X.ellipse(0, 0, r * .72, r, 0, 0, TAU); X.fill();
+  X.strokeStyle = crease; X.lineWidth = r * .13; X.lineCap = 'round';
+  X.beginPath(); X.moveTo(0, -r * .8); X.bezierCurveTo(r * .4, -r * .3, -r * .4, r * .3, 0, r * .8); X.stroke();
+  X.restore();
+}
+// map pin, tip at (x, y)
+function pin(x, y, r, col, hole) {
+  X.save(); X.fillStyle = col; X.beginPath();
+  X.arc(x, y - r * 1.7, r, Math.PI * .8, Math.PI * 2.2); X.lineTo(x, y); X.closePath(); X.fill();
+  X.fillStyle = hole; X.beginPath(); X.arc(x, y - r * 1.7, r * .42, 0, TAU); X.fill(); X.restore();
+}
+// placeholder mark (no logo supplied): cream disc, green mountains, orange sun
+function mark(x, y, R) {
+  X.save(); X.translate(x, y);
+  X.fillStyle = C.cream; X.beginPath(); X.arc(0, 0, R, 0, TAU); X.fill();
+  X.fillStyle = C.accent; X.beginPath(); X.arc(R * .3, -R * .32, R * .17, 0, TAU); X.fill();
+  X.fillStyle = C.green; X.beginPath();
+  X.moveTo(-R * .74, R * .36); X.lineTo(-R * .22, -R * .4); X.lineTo(R * .06, 0); X.lineTo(R * .26, -R * .2); X.lineTo(R * .74, R * .36); X.closePath(); X.fill();
+  X.fillRect(-R * .56, R * .5, R * 1.12, R * .08);
+  X.restore();
+}
+// drifting contour lines (山野 = mountains) — the house background texture
+function topo(t, col, alpha = .1, n = 16) {
+  X.save(); X.strokeStyle = hexA(col, alpha); X.lineWidth = 3 * U;
+  const gap = H / n, off = (t * 70 * U) % gap;
+  for (let i = -1; i <= n; i++) {
+    const y0 = i * gap + off; X.beginPath();
+    for (let x = -24 * U; x <= W + 24 * U; x += 24 * U) {
+      const y = y0 + Math.sin(x / (170 * U) + i * .9 + t * 1.1) * 34 * U + Math.sin(x / (61 * U) - i * 1.3 - t * 1.6) * 10 * U;
+      x < 0 ? X.moveTo(x, y) : X.lineTo(x, y);
+    }
+    X.stroke();
+  }
+  X.restore();
+}
+function ticket(x, y, w, h, col, notch) {
+  X.fillStyle = col; rr(x - w / 2, y - h / 2, w, h, 36 * U); X.fill();
+  X.fillStyle = notch;
+  X.beginPath(); X.arc(x - w / 2, y, 38 * U, 0, TAU); X.fill();
+  X.beginPath(); X.arc(x + w / 2, y, 38 * U, 0, TAU); X.fill();
+  X.save(); X.strokeStyle = hexA(C.green, .3); X.lineWidth = 4 * U; X.setLineDash([14 * U, 12 * U]);
+  rr(x - w / 2 + 50 * U, y - h / 2 + 24 * U, w - 100 * U, h - 48 * U, 20 * U); X.stroke(); X.restore();
+}
+function stamp(x, y, r, t, t0) {
+  const p = seg(t, t0, t0 + .2); if (p <= 0) return;
+  const s = lerp(2.3, 1, E.inCubic(p));
+  X.save(); X.translate(x, y); X.rotate(-.22); X.scale(s, s); X.globalAlpha = clamp(p * 3);
+  X.fillStyle = C.accent; X.beginPath(); X.arc(0, 0, r, 0, TAU); X.fill();
+  X.strokeStyle = C.cream; X.lineWidth = 5 * U; X.beginPath(); X.arc(0, 0, r * .84, 0, TAU); X.stroke();
+  X.restore();
+  X.save(); X.translate(x, y); X.rotate(-.22); X.scale(s, s); X.globalAlpha = clamp(p * 3);
+  T('半价', 0, r * .2, r * .62, { col: C.cream });
+  T('HALF PRICE', 0, r * .5, r * .15, { col: C.cream, fam: F_LAT, w: 700, gap: 3 * U });
+  X.restore();
+}
+const FINE = '活动时间 9月30日–10月7日 · 活动规则以门店公示为准';
+function fine(t, t0, col) {
+  const a = seg(t, t0, t0 + .2); if (a <= 0) return;
+  T(FINE, L.cx, L.safe.bottom - 36 * U, fit(FINE, 32 * U, L.safe.w, { w: 500 }), { w: 500, col, alpha: a });
+}
+const cupCols = bg => bg === C.cream ? { body: C.green, band: C.accent, ink: C.cream }
+  : bg === C.accent ? { body: C.cream, band: C.green, ink: C.accent } : { body: C.cream, band: C.accent, ink: C.green };
+
+// ---------------------------------------------------------------- 0–2 s  hook: 早八人 / 打工人 / 今天续命了吗？
+function sHook(t) {
+  const k = t < .5 ? 0 : t < 1 ? 1 : 2;
+  const bgc = [C.green, C.cream, C.accent][k], fg = [C.cream, C.green, C.green][k];
+  fillBg(bgc);
+  if (k === 2) sunburst(L.cx, L.cy - 330 * U, t, { col: C.cream, alpha: .16, spin: .7, n: 16 });
+  else stripes(t, fg, .07, k ? -1 : 1, 900);
+  const cyc = L.cy - 330 * U;
+  if (k === 2) speedLines(L.cx, cyc, t, 1 - seg(t, 1.0, 1.45), { col: C.cream });
+  shockwave(L.cx, L.cy + 170 * U, t, 1.02, { col: C.cream, max: 900 * U, lw: 12 * U });
+  if (k === 0) kine('早八人', L.cx, L.cy + 300 * U, fit('早八人', 300 * U, L.safe.w), t, 0, 'glitch', { col: C.cream });
+  if (k === 1) kine('打工人', L.cx, L.cy + 300 * U, fit('打工人', 300 * U, L.safe.w), t, .42, 'smear', { col: C.green });
+  if (k === 2) {
+    kine('今天', L.cx, L.cy + 130 * U, 84 * U, t, .96, 'rise', { col: C.green, gap: 10 * U });
+    kine('续命了吗？', L.cx, L.cy + 340 * U, fit('续命了吗？', 230 * U, L.safe.w), t, 1.0, 'bounce', { col: C.green });
+  }
+  // cup drawn last so the bounce-in letters fall from behind it
+  const cs = track(t, [[0, .92], [.5, 1.02], [1.0, 1.16]], 'playful');
+  cup(L.cx, cyc + Math.sin(t * 7) * 14 * U, cs * U, t, { ...cupCols(bgc), tilt: Math.sin(t * 5.5) * .12 });
+}
+
+// ---------------------------------------------------------------- 2–4 s  brand reveal
+function sBrand(t) {
+  fillBg(C.green);
+  topo(t, C.cream, .07);
+  sunburst(L.cx, L.cy + 20 * U, t, { col: C.cream, alpha: .04 + .04 * seg(t, 2.3, 2.5), spin: .4 });
+  shockwave(L.cx, L.cy + 20 * U, t, 2.35, { col: C.accent, max: 800 * U, lw: 12 * U });
+  bean(L.cx, L.cy - 420 * U, 72 * U * sp(t - 1.85, 'snappy'), .4 + Math.sin(t * 2) * .2, C.accent, C.green, Math.cos(t * 4.5));
+  rise('小寨新开了一家', L.cx, L.cy - 200 * U, 72 * U, t, 1.85, { col: C.cream, w: 700 });
+  const bs = fit('山野咖啡', 280 * U, L.safe.w, { fam: F_SER });
+  kine('山野咖啡', L.cx, L.cy + 90 * U, bs, t, 2.3, 'smear', { fam: F_SER, col: C.cream, st: .05 });
+  poly([[L.cx - 320 * U, L.cy + 170 * U], [L.cx + 320 * U, L.cy + 170 * U]], E.outCubic(seg(t, 2.6, 3.0)), { col: C.accent, lw: 10 * U });
+  T(scramble("SPECIALTY COFFEE · XI'AN", t, 2.75, .6), L.cx, L.cy + 270 * U, 40 * U, { fam: F_LAT, w: 700, col: C.cream, gap: 6 * U });
+}
+
+// ---------------------------------------------------------------- 4–6 s  THE OFFER (drop)
+function sDrop(t) {
+  fillBg(C.accent);
+  sunburst(L.cx, L.cy + 120 * U, t, { col: C.cream, alpha: .14, spin: .55, n: 16 });
+  stripes(t, C.green, .06, 1, 800);
+  shockwave(L.cx, L.cy + 120 * U, t, 4.0, { col: C.cream, max: 1100 * U, lw: 16 * U });
+  shockwave(L.cx, L.cy + 120 * U, t, 4.4, { col: C.green, max: 900 * U });
+  kine('开业福利', L.cx, L.cy - 470 * U, 72 * U, t, 3.9, 'rise', { col: C.cream, gap: 14 * U });
+  const lp = E.outCubic(seg(t, 4.0, 4.3));
+  X.fillStyle = C.cream;
+  X.fillRect(L.cx - 200 * U - 150 * U * lp, L.cy - 500 * U, 150 * U * lp, 6 * U);
+  X.fillRect(L.cx + 200 * U, L.cy - 500 * U, 150 * U * lp, 6 * U);
+  kine('第二杯', L.cx, L.cy - 190 * U, 250 * U, t, 3.9, 'spin', { col: C.green, st: .06 });
+  pop(t, 4.25, L.cx, L.cy + 120 * U, () => ticket(L.cx, L.cy + 120 * U, 840 * U, 400 * U, C.cream, C.accent));
+  slam('半价', L.cx, L.cy + 250 * U, 330 * U, t, 4.35, { col: C.green });
+  fine(t, 4.4, C.green);
+}
+
+// ---------------------------------------------------------------- 6–8 s  mechanism: 2 cups, stamp on the 2nd, dates
+function sDeal(t) {
+  fillBg(C.cream);
+  stripes(t, C.green, .05, -1, 600);
+  kine([['第二杯', C.green], ['半价', C.accent]], L.cx, L.safe.y + 150 * U, 120 * U, t, 5.85, 'rise');
+  const xs = [L.cx - 230 * U, L.cx + 230 * U], cyc = L.cy - 70 * U;
+  xs.forEach((x, i) => {
+    const t0 = 5.85 + i * .3;
+    pop(t, t0, x, cyc + 200 * U, () => cup(x, cyc, 1.2 * U, t, { ...cupCols(C.cream), tilt: Math.sin(t * 4 + i * 2) * .05 }), 'playful');
+    T(i ? '第 2 杯' : '第 1 杯', x, cyc + 300 * U, 50 * U, { col: C.green, w: 700, alpha: seg(t, t0 + .15, t0 + .3) });
+  });
+  pop(t, 6.1, L.cx, cyc, () => T('+', L.cx, cyc + 30 * U, 110 * U, { col: C.accent, fam: F_LAT, w: 700 }));
+  stamp(xs[1] + 10 * U, cyc - 10 * U, 125 * U, t, 6.72);
+  shockwave(xs[1] + 10 * U, cyc - 10 * U, t, 6.92, { col: C.accent, max: 600 * U });
+  const ds = fit('9.30 – 10.07', 150 * U, L.safe.w, { fam: F_LAT, w: 700 });
+  kine('9.30 – 10.07', L.cx, L.cy + 440 * U, ds, t, 6.4, 'stroke', { fam: F_LAT, w: 700, col: C.green, st: .025 });
+  fine(t, 5.85, C.green);
+}
+
+// ---------------------------------------------------------------- 8–10 s  origin: 保山 → 西安
+const PA = [L.cx - 250 * U, L.cy + 330 * U], PB = [L.cx + 240 * U, L.cy - 200 * U];
+const ROUTE = (() => {
+  const c1 = [L.cx + 260 * U, L.cy + 300 * U], c2 = [L.cx - 320 * U, L.cy - 140 * U];
+  return Array.from({ length: 61 }, (_, i) => {
+    const s = i / 60, m = 1 - s;
+    return [m * m * m * PA[0] + 3 * m * m * s * c1[0] + 3 * m * s * s * c2[0] + s * s * s * PB[0],
+            m * m * m * PA[1] + 3 * m * m * s * c1[1] + 3 * m * s * s * c2[1] + s * s * s * PB[1]];
+  });
+})();
+function sOrigin(t) {
+  fillBg(C.green);
+  topo(t, C.cream, .09);
+  kine('云南保山', L.cx, L.safe.y + 170 * U, fit('云南保山', 150 * U, L.safe.w), t, 7.85, 'stroke', { col: C.cream, st: .05 });
+  kine('小粒咖啡豆', L.cx, L.safe.y + 285 * U, 72 * U, t, 8.25, 'rise', { col: C.accent, gap: 8 * U });
+  poly(ROUTE, 1, { col: hexA(C.cream, .22), lw: 6 * U, dash: [2 * U, 18 * U] });
+  const rp = E.inOutCubic(seg(t, 8.2, 9.25));
+  poly(ROUTE, rp, { col: C.cream, lw: 10 * U });
+  pop(t, 7.9, PA[0], PA[1], () => pin(PA[0], PA[1], 40 * U, C.cream, C.green), 'playful');
+  T('云南 · 保山', PA[0], PA[1] + 72 * U, 46 * U, { col: C.cream, w: 700, alpha: seg(t, 8.0, 8.2) });
+  if (rp > 0 && rp < 1) { const [bx, by] = along(ROUTE, rp); bean(bx, by, 34 * U, t * 9, C.accent, C.green); }
+  pop(t, 9.22, PB[0], PB[1], () => pin(PB[0], PB[1], 46 * U, C.accent, C.cream), 'playful');
+  shockwave(PB[0], PB[1] - 78 * U, t, 9.3, { col: C.accent, max: 500 * U });
+  T('西安', PB[0], PB[1] + 80 * U, 64 * U, { col: C.cream, alpha: seg(t, 9.3, 9.45) });
+  T(scramble("BAOSHAN  >>>  XI'AN", t, 8.4, .7), L.cx, L.safe.bottom - 60 * U, 40 * U, { fam: F_LAT, w: 700, col: hexA(C.cream, .8), gap: 6 * U });
+}
+
+// ---------------------------------------------------------------- 10–12.5 s  wow: 门店现烘 — spinning bean in a 3D ring, heat field, vortex out
+function sRoast(t) {
+  fillBg(C.deep);
+  flowField(t, 9.72, { cell: 60 * U, beats: [10.0, 10.5, 11.0, 11.5], cols: [C.bg2, '#86A890', C.accent], hot: C.accent, vortex: [12.0, 12.5] });
+  const vc = 1 - E.inExpo(seg(t, 11.95, 12.45));
+  const s = sp(t - 9.8, 'playful') * vc;
+  const roast = E.inOutCubic(seg(t, 10.2, 11.8));
+  const col = mixHex('#C8C27E', '#6B3A1F', roast);
+  // ring with negative tilt so the bright front arc passes BELOW the bean; redraw the front half over it
+  const ringArgs = ['门店现烘·FRESH ROAST·', L.cx, L.cy + 20 * U, 400 * U * vc, -t * 1.5, 104 * U * Math.max(vc, .01), { tilt: -.3, front: C.accent, back: C.cream }];
+  if (vc > .02) ring3D(...ringArgs);
+  bean(L.cx, L.cy, 200 * U * s, .35, col, C.deep, Math.cos(t * 3.2));
+  if (vc > .02) { X.save(); X.beginPath(); X.rect(-W, L.cy + 20 * U, W * 3, H); X.clip(); ring3D(...ringArgs); X.restore(); }
+  X.save(); X.translate(L.cx, L.cy); X.scale(vc, vc); X.translate(-L.cx, -L.cy);
+  kine('门店现烘', L.cx, L.safe.y + 190 * U, fit('门店现烘', 170 * U, L.safe.w), t, 9.95, 'glitch', { col: C.cream });
+  T(scramble('ROASTED IN STORE', t, 10.4, .6, 3), L.cx, L.safe.bottom - 80 * U, 44 * U, { fam: F_LAT, w: 700, col: C.cream, gap: 8 * U });
+  X.restore();
+}
+
+// ---------------------------------------------------------------- 12.5–14.5 s  8th-note montage → 都来一杯
+const MONT = [
+  { at: 12.5, w: '早八', bg: C.cream, fg: C.green, st: 'glitch' },
+  { at: 12.75, w: '午休', bg: C.green, fg: C.cream, st: 'smear' },
+  { at: 13.0, w: '赶DDL', bg: C.accent, fg: C.green, st: 'spin' },
+  { at: 13.25, w: '下班', bg: C.cream, fg: C.green, st: 'bounce' },
+];
+function sMont(t) {
+  if (t >= 13.5) return sAll(t);
+  let i = 0; MONT.forEach((m, k) => { if (t >= m.at) i = k; });
+  const m = MONT[i], side = i % 2 ? 1 : -1;
+  fillBg(m.bg);
+  stripes(t, m.fg, .09, side, 1500);
+  cup(L.cx + side * 250 * U, L.cy - 330 * U, .85 * U, t, { ...cupCols(m.bg), tilt: side * (.22 - .1 * sp(t - m.at, 'snappy')) });
+  kine(m.w, L.cx, L.cy + 170 * U, fit(m.w, 300 * U, L.safe.w), t, m.at - .08, m.st, { col: m.fg });
+}
+function sAll(t) {
+  fillBg(C.accent);
+  sunburst(L.cx, L.cy - 100 * U, t, { col: C.green, alpha: .1, spin: -.6, n: 16 });
+  shockwave(L.cx, L.cy + 100 * U, t, 13.5, { col: C.cream, max: 1000 * U, lw: 14 * U });
+  for (let k = 0; k < 4; k++) {
+    const x = L.cx + (k - 1.5) * 220 * U;
+    pop(t, 13.55 + k * .08, x, L.cy - 300 * U, () => cup(x, L.cy - 380 * U, .55 * U, t + k, { ...cupCols(C.accent), tilt: Math.sin(t * 6 + k) * .08 }), 'playful');
+  }
+  slam('都来一杯', L.cx, L.cy + 200 * U, fit('都来一杯', 250 * U, L.safe.w), t, 13.45, { col: C.green });
+}
+
+// ---------------------------------------------------------------- 14.5–17 s  place: 小寨东路88号, collapse to a point
+const ROADY = L.cy - 330 * U;
+function sPlace(t) {
+  fillBg(C.cream);
+  const col = 1 - E.inExpo(seg(t, 16.55, 16.98));          // collapse into the pin head (bookend)
+  const px = L.cx, py = ROADY - 46 * U * 1.7;
+  X.save(); X.translate(px, py); X.scale(col, col); X.translate(-px, -py);
+  topo(t, C.green, .06);
+  [-330, -90, 190, 400].forEach((dx, i) => poly([[L.cx + dx * U, ROADY - 320 * U], [L.cx + (dx + 50) * U, ROADY + 290 * U]],
+    E.outCubic(seg(t, 14.3 + i * .06, 14.8 + i * .06)), { col: hexA(C.green, .3), lw: 16 * U }));
+  poly([[-40 * U, ROADY], [W + 40 * U, ROADY]], E.outCubic(seg(t, 14.25, 14.75)), { col: C.green, lw: 36 * U });
+  for (let k = 0; k < 6; k++) {                               // traffic along 小寨东路
+    const x = ((t * 420 + k * 210) * U) % (W + 200 * U) - 100 * U;
+    X.fillStyle = C.accent; X.globalAlpha = seg(t, 14.6, 14.8); X.fillRect(x, ROADY - 5 * U, 40 * U, 10 * U); X.globalAlpha = 1;
+  }
+  T('小寨东路', L.cx - 330 * U, ROADY - 36 * U, 38 * U, { col: C.green, w: 700, alpha: seg(t, 14.7, 14.9) });
+  const drop = sp(t - 14.72, 'playful');
+  if (t > 14.72) pin(px, ROADY - (1 - drop) * 520 * U, 46 * U, C.accent, C.cream);
+  shockwave(px, ROADY, t, 14.98, { col: C.accent, max: 520 * U, lw: 10 * U });
+  rise('西安市雁塔区', L.cx, L.cy + 40 * U, 54 * U, t, 14.8, { col: C.green, w: 700 });
+  kine('小寨东路', L.cx, L.cy + 215 * U, 140 * U, t, 14.95, 'rise', { col: C.green, st: .05 });
+  const nx = L.cx + 60 * U;
+  counter(88, nx, L.cy + 450 * U, 230 * U, t, 15.1, .5, { col: C.accent, align: 'right', alpha: seg(t, 15.1, 15.15) });
+  T('号', nx + 20 * U, L.cy + 450 * U, 120 * U, { col: C.green, align: 'left', alpha: seg(t, 15.2, 15.3) });
+  X.restore();
+  if (col < 1) { X.fillStyle = C.accent; X.beginPath(); X.arc(px, py, 26 * U * (1 - col), 0, TAU); X.fill(); }
+  // 顺路来一杯 sits outside the collapse so it leaves last
+  X.save(); X.globalAlpha = 1; X.translate(0, E.inExpo(seg(t, 16.6, 16.95)) * 300 * U);
+  kine('顺路来一杯 →', L.cx, L.safe.bottom - 20 * U, 70 * U, t, 15.7, 'bounce', { col: C.green });
+  X.restore();
+}
+
+// ---------------------------------------------------------------- 17–20 s  end card
+function sEnd(t) {
+  fillBg(C.green);
+  let pulse = 0; for (let b = 17.5; b < 20; b += .5) if (t >= b) pulse += Math.exp(-(t - b) * 9);
+  const my = L.cy - 370 * U;
+  sunburst(L.cx, my, t, { col: C.cream, alpha: .06 + .05 * pulse, spin: .35, n: 20 });
+  topo(t, C.cream, .06);
+  shockwave(L.cx, my, t, 17.02, { col: C.accent, max: 1000 * U, lw: 16 * U });
+  shockwave(L.cx, my, t, 17.3, { col: C.cream, max: 700 * U });
+  for (const b of [18.5, 19.0, 19.5]) shockwave(L.cx, my, t, b, { col: C.cream, max: 520 * U, lw: 4 * U, dur: .5 });
+  const ms = sp(t - 16.92, 'playful');
+  X.save(); X.translate(L.cx, my); X.rotate((1 - Math.min(1, ms)) * -.9); X.scale(ms * (1 + .04 * pulse), ms * (1 + .04 * pulse));
+  mark(0, 0, 170 * U); X.restore();
+  kine('山野咖啡', L.cx, L.cy - 20 * U, fit('山野咖啡', 190 * U, L.safe.w, { fam: F_SER, gap: 16 * U }), t, 17.2, 'spin', { fam: F_SER, col: C.cream, gap: 16 * U, st: .06 });
+  rise('云南保山小粒咖啡 · 门店现烘', L.cx, L.cy + 80 * U, 46 * U, t, 17.55, { col: C.cream, w: 500, st: .02 });
+  const pw = 900 * U, ph = 150 * U, py = L.cy + 175 * U, pk = 1 + .035 * pulse * seg(t, 18.4, 18.5);
+  pop(t, 17.85, L.cx, py + ph / 2, () => {
+    X.save(); X.translate(L.cx, py + ph / 2); X.scale(pk, pk); X.translate(-L.cx, -(py + ph / 2));
+    X.fillStyle = C.accent; rr(L.cx - pw / 2, py, pw, ph, ph / 2); X.fill();
+    T([['第二杯半价', C.green], ['  9.30–10.07', C.cream]], L.cx, py + ph * .66, 62 * U, { w: 900 });
+    sheen(L.cx - pw / 2, py, pw, ph, ph / 2, t, 18.3, .55);
+    sheen(L.cx - pw / 2, py, pw, ph, ph / 2, t, 19.3, .55);
+    X.restore();
+  });
+  pop(t, 18.1, L.cx - 356 * U, L.cy + 440 * U, () => pin(L.cx - 356 * U, L.cy + 440 * U, 20 * U, C.accent, C.green));
+  rise('西安市雁塔区小寨东路88号', L.cx + 22 * U, L.cy + 432 * U, 52 * U, t, 18.15, { col: C.cream, w: 700, st: .02 });
+  T('活动规则以门店公示为准', L.cx, L.cy + 510 * U, 30 * U, { col: C.cream, w: 500, alpha: .8 * seg(t, 18.4, 18.6) });
+}
+
+const SCENES = [
+  { id: 'hook', from: 0.0, to: 2.0, draw: sHook },
+  { id: 'brand', from: 2.0, to: 4.0, draw: sBrand },
+  { id: 'drop', from: 4.0, to: 6.0, draw: sDrop },
+  { id: 'deal', from: 6.0, to: 8.0, draw: sDeal },
+  { id: 'origin', from: 8.0, to: 10.0, draw: sOrigin },
+  { id: 'roast', from: 10.0, to: 12.5, draw: sRoast },
+  { id: 'mont', from: 12.5, to: 14.5, draw: sMont },
+  { id: 'place', from: 14.5, to: 17.0, draw: sPlace },
+  { id: 'end', from: 17.0, to: DUR, draw: sEnd },
+];
+// Transition centred on each boundary: cut | push | iris | bars | wipe | stripes | tear | zoom | slice
+const TRANS = [
+  { at: 0.5, type: 'cut' }, { at: 1.0, type: 'cut' },
+  { at: 2.0, type: 'tear', dur: 0.4, ring: C.cream },
+  { at: 4.0, type: 'zoom', dur: 0.4 },
+  { at: 6.0, type: 'cut' },
+  { at: 8.0, type: 'slice', dur: 0.4 },
+  { at: 10.0, type: 'iris', dur: 0.45, x: PB[0] / W, y: (PB[1] - 78 * U) / H },
+  { at: 12.5, type: 'cut' }, { at: 12.75, type: 'cut' }, { at: 13.0, type: 'cut' }, { at: 13.25, type: 'cut' }, { at: 13.5, type: 'cut' },
+  { at: 14.5, type: 'stripes', dur: 0.5 },
+  { at: 17.0, type: 'cut' },
+];
+const IMPACTS = [[0.02, 14], [0.52, 12], [1.02, 18], [2.35, 10], [4.0, 24], [4.4, 10], [6.92, 16], [9.3, 10], [12.5, 12], [13.5, 16], [14.98, 12], [17.02, 22]];
+const ZOOMS = [[1.02, .06], [2.35, .04], [4.0, .08], [6.92, .05], [13.5, .05], [17.02, .07]];
+const FLASHES = [[4.0, .45]];
+const story = t => t;
+/* ===== SCENES END ===== */
+
+/* =========================================================================
+   7. composition, transitions, motion blur — usually no need to edit
+   ========================================================================= */
+function sceneAt(t) { for (const s of SCENES) if (t >= s.from && t < s.to) return s; return SCENES[SCENES.length - 1]; }
+function transAt(t) { for (const tr of TRANS) if (tr.type !== 'cut' && Math.abs(t - tr.at) < tr.dur / 2) return tr; return null; }
+function shake(t) {
+  let dx = 0, dy = 0;
+  for (const [ti, amp] of IMPACTS) {
+    const d = t - ti; if (d < 0 || d > .6) continue;
+    const k = amp * L.u * Math.exp(-d * 11);
+    dx += k * Math.sin(d * 83 + ti * 7); dy += k * Math.cos(d * 71 + ti * 3);
+  }
+  return { dx, dy };
+}
+function drawTransition(tr, t) {
+  const A = sceneAt(tr.at - 1e-4), B = sceneAt(tr.at + 1e-4);
+  const p = E.inOutCubic(seg(t, tr.at - tr.dur / 2, tr.at + tr.dur / 2));
+  if (tr.type === 'push') {
+    const v = tr.dir === 'left' ? [-W, 0] : [0, -H];
+    X.save(); X.translate(v[0] * p, v[1] * p); A.draw(t); X.restore();
+    X.save(); X.translate(-v[0] * (1 - p), -v[1] * (1 - p)); B.draw(t); X.restore();
+  } else if (tr.type === 'iris') {
+    const R = Math.hypot(W, H) * p, x = tr.x * W, y = tr.y * H;
+    A.draw(t);
+    X.save(); X.beginPath(); X.arc(x, y, R, 0, TAU); X.clip(); B.draw(t); X.restore();
+    if (tr.ring && p > 0 && p < 1) { X.strokeStyle = tr.ring; X.lineWidth = (26 * (1 - p) + 3) * L.u; X.beginPath(); X.arc(x, y, R, 0, TAU); X.stroke(); }
+  } else if (tr.type === 'bars') {
+    A.draw(t);
+    const n = tr.n || 6, bw = W / n, st = .025, t0 = tr.at - tr.dur / 2, len = tr.dur - (n - 1) * st;
+    for (let i = 0; i < n; i++) {
+      const q = E.inOutCubic(seg(t, t0 + i * st, t0 + i * st + len));
+      X.save(); X.beginPath(); X.rect(i * bw - 1, 0, bw + 2, H * q); X.clip(); B.draw(t); X.restore();
+    }
+  } else if (tr.type === 'stripes') {  // colored columns rise over A, then their tails leave revealing B
+    const n = tr.n || 10, bw = W / n, cols = tr.cols || [C.accent, C.accent2, C.bg2];
+    const t0 = tr.at - tr.dur / 2, half = tr.dur / 2;
+    (t < tr.at ? A : B).draw(t);
+    for (let i = 0; i < n; i++) {
+      const d = i * half * .35 / n;
+      const top = lerp(H, 0, E.inOutCubic(seg(t, t0 + d, t0 + d + half * .65)));
+      const bot = lerp(H, 0, E.inOutCubic(seg(t, tr.at + d, tr.at + d + half * .65)));
+      if (bot - top > 0) { X.fillStyle = cols[i % cols.length]; X.fillRect(i * bw - 1, top, bw + 2, bot - top); }
+    }
+  } else if (tr.type === 'tear') {     // A splits along the middle and the halves fly apart
+    const off = p * (H / 2 + 80 * L.u);
+    B.draw(t);
+    // clip AFTER translating, so each half carries its own content away (the original clipped first, which
+    // showed A's lower half in the top window and never revealed B when a scene's background overscans)
+    X.save(); X.translate(0, -off); X.beginPath(); X.rect(-W, -H, W * 3, H * 1.5); X.clip(); A.draw(t); X.restore();
+    X.save(); X.translate(0, off); X.beginPath(); X.rect(-W, H / 2, W * 3, H * 1.5); X.clip(); A.draw(t); X.restore();
+    if (p > 0 && p < 1) { X.fillStyle = tr.ring || C.accent; X.fillRect(0, H / 2 - off - 6 * L.u, W, 6 * L.u); X.fillRect(0, H / 2 + off, W, 6 * L.u); }
+  } else if (tr.type === 'zoom') {     // push through A into B with speed lines
+    const q = seg(t, tr.at - tr.dur / 2, tr.at + tr.dur / 2);
+    if (q < .5) { const k = E.inExpo(q * 2); X.save(); X.translate(W / 2, H / 2); X.scale(1 + k * 3, 1 + k * 3); X.translate(-W / 2, -H / 2); A.draw(t); X.restore(); }
+    else { const k = E.outExpo((q - .5) * 2); X.save(); X.translate(W / 2, H / 2); X.scale(.7 + .3 * k, .7 + .3 * k); X.translate(-W / 2, -H / 2); B.draw(t); X.restore(); }
+    speedLines(W / 2, H / 2, t, 1 - Math.abs(q - .5) * 2);
+  } else if (tr.type === 'slice') {    // glitch strips shove A out and B in
+    const n = 14, sh2 = H / n;
+    for (let i = 0; i < n; i++) {
+      const dir = hr(i * 3.1) > .5 ? 1 : -1, far = (.4 + hr(i) * 1.2) * W;
+      X.save(); X.beginPath(); X.rect(0, i * sh2, W, sh2 + 1); X.clip();
+      if (t < tr.at) { X.translate(dir * E.inExpo(seg(t, tr.at - tr.dur / 2, tr.at)) * far, 0); A.draw(t); }
+      else { X.translate(-dir * (1 - E.outExpo(seg(t, tr.at, tr.at + tr.dur / 2))) * far, 0); B.draw(t); }
+      X.restore();
+    }
+  } else { // wipe (diagonal)
+    A.draw(t);
+    const d = p * (W + H) * 1.05;
+    X.save(); X.beginPath(); X.moveTo(0, H); X.lineTo(0, H - d); X.lineTo(d, H); X.closePath(); X.clip(); B.draw(t); X.restore();
+    if (tr.ring) { X.strokeStyle = tr.ring; X.lineWidth = 14 * L.u; X.beginPath(); X.moveTo(0, H - d); X.lineTo(d, H); X.stroke(); }
+  }
+}
+function scene(t) {
+  t = story(t);
+  X.save(); X.setTransform(1, 0, 0, 1, 0, 0); X.globalAlpha = 1; X.globalCompositeOperation = 'source-over';
+  const sh = shake(t);
+  let z = 1.015;
+  for (const [ti, amt] of ZOOMS) if (t >= ti) z += amt * Math.exp(-(t - ti) * 7);
+  X.translate(W / 2 + sh.dx, H / 2 + sh.dy); X.scale(z, z); X.translate(-W / 2, -H / 2);
+  const tr = transAt(t);
+  if (tr) drawTransition(tr, t); else sceneAt(t).draw(t);
+  X.restore();
+}
+function post(t) {
+  t = story(t);
+  let a = 0;
+  for (const [ti, k] of FLASHES) if (t >= ti && t < ti + .07) a = Math.max(a, k * Math.pow(1 - (t - ti) / .07, 2));
+  if (a > 0) { X.fillStyle = hexA('#FFF6E0', a); X.fillRect(0, 0, W, H); }
+  const g = X.createRadialGradient(W / 2, H / 2, Math.min(W, H) * .45, W / 2, H / 2, Math.max(W, H) * .75);
+  g.addColorStop(0, 'rgba(0,0,0,0)'); g.addColorStop(1, 'rgba(0,0,0,0.25)');
+  X.fillStyle = g; X.fillRect(0, 0, W, H);
+}
+// Motion blur: SUB samples across a 180° shutter; dense sampling inside fast transitions
+// (sparse samples there show as stepped ghosts); never average across a hard cut.
+const CUTS = TRANS.filter(tr => tr.type === 'cut').map(tr => tr.at);
+const FAST = TRANS.filter(tr => tr.type !== 'cut').map(tr => [tr.at - tr.dur / 2 - .05, tr.at + tr.dur / 2 + .05]);
+const SUB = 5, SUB_FAST = 16, SHUTTER = 0.5;
+const acc = document.createElement('canvas'); acc.width = W; acc.height = H;
+const ACC = acc.getContext('2d');
+function render(t, blur = true) {
+  if (blur) {
+    const n = FAST.some(([a, b]) => t >= a && t <= b) ? SUB_FAST : SUB;
+    for (let k = 0; k < n; k++) {
+      let ts = t + (k / (n - 1) - .5) * SHUTTER / FPS;
+      for (const c of CUTS) { if (ts < c && c <= t) ts = c; else if (t < c && c <= ts) ts = c - 1e-4; }
+      scene(clamp(ts, 0, DUR - 1e-4));
+      ACC.globalAlpha = 1 / (k + 1); ACC.drawImage(cv, 0, 0);
+    }
+    ACC.globalAlpha = 1; X.setTransform(1, 0, 0, 1, 0, 0); X.drawImage(acc, 0, 0);
+  } else scene(t);
+  X.save(); X.setTransform(1, 0, 0, 1, 0, 0); post(t); X.restore();
+}
+window.render = render;
+window.seek = t => { render(t, true); return true; };
+// A family is "missing" if text in it measures exactly like the generic fallback.
+function missingFonts() {
+  const probe = '动态设计 Motion 0123', out = [];
+  for (const fam of FONT_FAMILIES) {
+    let same = true;
+    for (const fb of ['monospace', 'serif']) {
+      X.font = `700 100px ${fb}`; const a = X.measureText(probe).width;
+      X.font = `700 100px "${fam}", ${fb}`; const b = X.measureText(probe).width;
+      if (Math.abs(a - b) > 0.5) same = false;
+    }
+    if (same) out.push(fam);
+  }
+  return out;
+}
+window.missingFonts = missingFonts;
+window.META = { W, H, FPS, DUR, FMT, TITLE: CONFIG.TITLE, FONTS: FONTS_TO_LOAD, TRANS: TRANS.map(({ at, type, dur }) => ({ at, type, dur })) };
+
+/* ---------- 8. live preview (disabled during capture) ---------- */
+let playing = !window.__CAPTURE__, t0 = performance.now(), tp = 0;
+function tick(now) {
+  if (window.__CAPTURE__) return;
+  if (playing) tp = ((now - t0) / 1000) % DUR;
+  render(tp, false); requestAnimationFrame(tick);
+}
+Promise.all(FONTS_TO_LOAD.map(f => document.fonts.load(f))).then(() => requestAnimationFrame(tick));
+addEventListener('keydown', e => {
+  if (e.code === 'Space') { playing = !playing; t0 = performance.now() - tp * 1000; }
+  if (e.code === 'ArrowRight') { playing = false; tp = Math.min(DUR - 1e-3, tp + 1 / FPS); }
+  if (e.code === 'ArrowLeft') { playing = false; tp = Math.max(0, tp - 1 / FPS); }
+});
+addEventListener('click', () => { playing = true; t0 = performance.now(); });
+</script>
+</body>
+</html>
